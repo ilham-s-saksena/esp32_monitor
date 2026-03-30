@@ -3,7 +3,6 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:network_info_plus/network_info_plus.dart';
-import 'package:network_tools/network_tools.dart';
 import 'package:android_intent_plus/android_intent.dart';
 import 'dart:async';
 import 'package:url_launcher/url_launcher.dart';
@@ -276,7 +275,7 @@ class _SetupPageState extends State<SetupPage> {
                               ),
                               SizedBox(height: 6),
                               Text(
-                                "SSID : The Jawirs\nPassword : Tvri1234",
+                                "SSID : IOT\nPassword : 12345678",
                                 style: TextStyle(
                                   fontSize: 14,
                                 ),
