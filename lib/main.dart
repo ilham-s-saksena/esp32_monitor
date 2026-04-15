@@ -114,82 +114,174 @@ class _SetupPageState extends State<SetupPage> {
 
   bool isScanning = false;
 
-  Future<void> scanNetwork() async {
+  // Future<void> scanNetwork() async {
 
-    if (isScanning) return;
+  //   if (isScanning) return;
 
-    setState(() {
-      isScanning = true;
-      devices.clear();
-    });
+  //   setState(() {
+  //     isScanning = true;
+  //     devices.clear();
+  //   });
 
-    try {
+  //   try {
 
-      RawDatagramSocket socket =
-          await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+  //     RawDatagramSocket socket =
+  //         await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
 
-      socket.broadcastEnabled = true;
+  //     socket.broadcastEnabled = true;
 
-      socket.listen((event) {
+  //     socket.listen((event) {
 
-        if (event == RawSocketEvent.read) {
+  //       if (event == RawSocketEvent.read) {
 
-          Datagram? dg = socket.receive();
+  //         Datagram? dg = socket.receive();
 
-          if (dg != null) {
+  //         if (dg != null) {
 
-            String msg = String.fromCharCodes(dg.data);
+  //           String msg = String.fromCharCodes(dg.data);
 
-            if (msg.startsWith("ESP32")) {
+  //           if (msg.startsWith("ESP32")) {
 
-              String ip = dg.address.address;
+  //             String ip = dg.address.address;
 
-              if (!devices.contains(ip)) {
+  //             if (!devices.contains(ip)) {
 
-                setState(() {
-                  devices.add(ip);
-                });
+  //               setState(() {
+  //                 devices.add(ip);
+  //               });
 
-              }
+  //             }
 
-            }
+  //           }
 
-          }
+  //         }
 
-        }
+  //       }
 
-      });
+  //     });
 
-      // broadcast ke subnet hotspot
-      final broadcast = InternetAddress("192.168.43.255");
+  //     // broadcast ke subnet hotspot
+  //     final broadcast = InternetAddress("192.168.43.255");
 
-      for (int i = 0; i < 3; i++) {
+  //     for (int i = 0; i < 3; i++) {
 
-        socket.send(
-          "DISCOVER_ESP32".codeUnits,
-          broadcast,
-          4210,
-        );
+  //       socket.send(
+  //         "DISCOVER_ESP32".codeUnits,
+  //         broadcast,
+  //         4210,
+  //       );
 
-        await Future.delayed(Duration(milliseconds: 200));
+  //       await Future.delayed(Duration(milliseconds: 200));
 
-      }
+  //     }
 
-      await Future.delayed(Duration(seconds: 2));
+  //     await Future.delayed(Duration(seconds: 2));
 
-      socket.close();
+  //     socket.close();
 
-    } catch (e) {
+  //   } catch (e) {
 
-      print("Discovery error: $e");
+  //     print("Discovery error: $e");
 
+  //   }
+
+  //   setState(() {
+  //     isScanning = false;
+  //   });
+
+  // }
+
+
+InternetAddress _calculateBroadcast(String ip, String subnet) {
+  List<int> ipParts = ip.split('.').map(int.parse).toList();
+  List<int> subnetParts = subnet.split('.').map(int.parse).toList();
+
+  List<int> broadcastParts = List.generate(4, (i) {
+    return ipParts[i] | (~subnetParts[i] & 0xFF);
+  });
+
+  return InternetAddress(broadcastParts.join('.'));
+}
+
+Future<void> scanNetwork() async {
+  if (isScanning) return;
+
+  setState(() {
+    isScanning = true;
+    devices.clear();
+  });
+
+  try {
+    final info = NetworkInfo();
+
+    String? ip = await info.getWifiIP();
+    String? subnet = await info.getWifiSubmask();
+
+    if (ip == null || subnet == null) {
+      throw Exception("Tidak bisa mendapatkan IP/Subnet");
     }
 
-    setState(() {
-      isScanning = false;
+    print("IP: $ip");
+    print("Subnet: $subnet");
+
+    // 🔥 Hitung broadcast address
+    InternetAddress broadcast = _calculateBroadcast(ip, subnet);
+
+    print("Broadcast: ${broadcast.address}");
+
+    RawDatagramSocket socket =
+        await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+
+    socket.broadcastEnabled = true;
+
+    socket.listen((event) {
+      if (event == RawSocketEvent.read) {
+        Datagram? dg = socket.receive();
+
+        if (dg != null) {
+          String msg = String.fromCharCodes(dg.data);
+
+          if (msg.startsWith("ESP32")) {
+            String ip = dg.address.address;
+
+            if (!devices.contains(ip)) {
+              setState(() {
+                devices.add(ip);
+              });
+            }
+          }
+        }
+      }
     });
 
+    // 🚀 Kirim ke beberapa broadcast sekaligus (biar robust)
+    List<InternetAddress> broadcasts = [
+      broadcast,
+      InternetAddress("255.255.255.255"), // fallback universal
+    ];
+
+    for (var b in broadcasts) {
+      for (int i = 0; i < 3; i++) {
+        socket.send(
+          "DISCOVER_ESP32".codeUnits,
+          b,
+          4210,
+        );
+        await Future.delayed(const Duration(milliseconds: 200));
+      }
+    }
+
+    await Future.delayed(const Duration(seconds: 2));
+
+    socket.close();
+  } catch (e) {
+    print("Discovery error: $e");
   }
+
+  setState(() {
+    isScanning = false;
+  });
+}
 
 
   @override
