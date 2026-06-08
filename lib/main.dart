@@ -102,8 +102,13 @@ class Esp32DiscoveryService {
   final NetworkInfo _networkInfo;
   final DiscoveryConfig _config;
 
+  /// FIXED PORT
+  /// lebih stabil untuk hotspot / CGNAT / 100.x.x.x
+  static const int _localPort = 4211;
+
   Future<NetworkDetails?> getNetworkInfo() async {
     final permission = await Permission.location.request();
+
     if (!permission.isGranted) {
       debugPrint('[DISCOVERY] Location permission denied');
       return null;
@@ -120,10 +125,13 @@ class Esp32DiscoveryService {
 
     final deviceIp = ip!;
     final broadcast = calculateBroadcast(deviceIp, subnet);
-    debugPrint(
-      '[DISCOVERY] SSID=$ssid IP=$deviceIp SUBNET=${subnet ?? "unknown"}',
-    );
-    debugPrint('[DISCOVERY] Broadcast=${broadcast?.address ?? "unavailable"}');
+
+    debugPrint('================ NETWORK INFO ================');
+    debugPrint('[DISCOVERY] SSID      : $ssid');
+    debugPrint('[DISCOVERY] IP        : $deviceIp');
+    debugPrint('[DISCOVERY] SUBNET    : $subnet');
+    debugPrint('[DISCOVERY] BROADCAST : ${broadcast?.address}');
+    debugPrint('==============================================');
 
     return NetworkDetails(
       ssid: ssid ?? 'Unknown',
@@ -139,7 +147,8 @@ class Esp32DiscoveryService {
     }
 
     final ipParts = _parseIpv4(ip);
-    final subnetParts = _parseIpv4(subnet!);
+    final subnetParts = _parseIpv4(subnet);
+
     if (ipParts == null || subnetParts == null) {
       return null;
     }
@@ -149,7 +158,12 @@ class Esp32DiscoveryService {
       (index) => ipParts[index] | (~subnetParts[index] & 0xFF),
     );
 
-    return InternetAddress(broadcastParts.join('.'));
+    return InternetAddress(
+      '${broadcastParts[0]}.'
+      '${broadcastParts[1]}.'
+      '${broadcastParts[2]}.'
+      '${broadcastParts[3]}',
+    );
   }
 
   StreamSubscription<RawSocketEvent> listenResponses({
@@ -159,26 +173,34 @@ class Esp32DiscoveryService {
   }) {
     return socket.listen(
       (event) {
-        if (event != RawSocketEvent.read) {
-          return;
-        }
+        if (event != RawSocketEvent.read) return;
 
         Datagram? datagram;
+
         while ((datagram = socket.receive()) != null) {
-          final payload = utf8
-              .decode(datagram!.data, allowMalformed: true)
-              .trim();
-          final sourceIp = datagram.address.address;
+          try {
+            final payload = utf8
+                .decode(datagram!.data, allowMalformed: true)
+                .trim();
 
-          debugPrint('[DISCOVERY] Response from $sourceIp payload="$payload"');
+            final sourceIp = datagram.address.address;
+            final sourcePort = datagram.port;
 
-          if (!payload.startsWith(_config.responsePrefix)) {
-            continue;
-          }
+            debugPrint(
+              '[DISCOVERY] RX <- $sourceIp:$sourcePort "$payload"',
+            );
 
-          if (discovered.add(sourceIp)) {
-            debugPrint('[DISCOVERY] Device accepted: $sourceIp');
-            onDeviceFound?.call(sourceIp);
+            if (!payload.startsWith(_config.responsePrefix)) {
+              continue;
+            }
+
+            if (discovered.add(sourceIp)) {
+              debugPrint('[DISCOVERY] DEVICE FOUND: $sourceIp');
+
+              onDeviceFound?.call(sourceIp);
+            }
+          } catch (e) {
+            debugPrint('[DISCOVERY] Response parse error: $e');
           }
         }
       },
@@ -197,73 +219,58 @@ class Esp32DiscoveryService {
 
     for (final target in targets) {
       try {
-        final sent = socket.send(payload, target, _config.port);
+        final sent = socket.send(
+          payload,
+          target,
+          _config.port,
+        );
+
         debugPrint(
-          '[DISCOVERY] Sent $sent bytes to ${target.address}:${_config.port}',
+          '[DISCOVERY] TX -> ${target.address}:${_config.port} ($sent bytes)',
         );
       } on SocketException catch (error) {
-        debugPrint('[DISCOVERY] Send failed to ${target.address}: $error');
+        debugPrint(
+          '[DISCOVERY] Send failed ${target.address}: $error',
+        );
       } catch (error) {
         debugPrint(
-          '[DISCOVERY] Unexpected send error to ${target.address}: $error',
+          '[DISCOVERY] Unexpected send error ${target.address}: $error',
         );
       }
     }
   }
 
-  Future<void> scanSubnet(
-    RawDatagramSocket socket, {
-    required String deviceIp,
-    String? subnet,
-  }) async {
-    final hosts = _buildScanTargets(deviceIp, subnet);
-
-    if (hosts.isEmpty) {
-      debugPrint('[DISCOVERY] No subnet targets generated');
-      return;
-    }
-
-    debugPrint(
-      '[DISCOVERY] Scanning ${hosts.length} targets in batches of ${_config.batchSize}',
-    );
-
-    for (var start = 0; start < hosts.length; start += _config.batchSize) {
-      final end = start + _config.batchSize > hosts.length
-          ? hosts.length
-          : start + _config.batchSize;
-      final batch = hosts.sublist(start, end);
-
-      await Future.wait(
-        batch.map(
-          (host) async =>
-              sendDiscovery(socket, targets: [InternetAddress(host)]),
-        ),
-      );
-
-      if (end < hosts.length) {
-        await Future.delayed(_config.batchPause);
-      }
-    }
-  }
-
+  /// =========================================
+  /// MAIN DISCOVERY
+  /// =========================================
   Future<List<String>> discoverDevices({
     void Function(String ip)? onDeviceFound,
   }) async {
     final info = await getNetworkInfo();
+
     if (info == null) {
       return const [];
     }
 
     RawDatagramSocket? socket;
     StreamSubscription<RawSocketEvent>? subscription;
+
     final discovered = <String>{};
 
     try {
-      socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+      /// IMPORTANT:
+      /// fixed port jauh lebih stabil
+      socket = await RawDatagramSocket.bind(
+        InternetAddress.anyIPv4,
+        _localPort,
+      );
+
       socket.broadcastEnabled = true;
       socket.readEventsEnabled = true;
+      socket.writeEventsEnabled = false;
+
       debugPrint(
-        '[DISCOVERY] UDP socket bound on ${socket.address.address}:${socket.port}',
+        '[DISCOVERY] UDP READY ${socket.address.address}:${socket.port}',
       );
 
       subscription = listenResponses(
@@ -272,76 +279,161 @@ class Esp32DiscoveryService {
         onDeviceFound: onDeviceFound,
       );
 
-      final broadcastTargets = <InternetAddress>{
-        if (info.broadcast != null) info.broadcast!,
-        InternetAddress('255.255.255.255'),
-      };
+      /// =========================================
+      /// BROADCAST TARGETS
+      /// =========================================
 
-      for (var attempt = 0; attempt < _config.broadcastRepeats; attempt++) {
-        debugPrint(
-          '[DISCOVERY] Broadcast attempt ${attempt + 1}/${_config.broadcastRepeats}',
-        );
-        await sendDiscovery(socket, targets: broadcastTargets);
+      final targets = <InternetAddress>{};
+
+      /// subnet broadcast
+      if (info.broadcast != null) {
+        targets.add(info.broadcast!);
       }
 
-      await scanSubnet(socket, deviceIp: info.ip, subnet: info.subnet);
+      /// universal broadcast
+      targets.add(InternetAddress('255.255.255.255'));
 
-      await Future.delayed(_config.timeout);
-      return discovered.toList()..sort();
+      /// hotspot compatibility
+      ///
+      /// beberapa hotspot aneh hanya menerima
+      /// directed broadcast
+      final ipParts = _parseIpv4(info.ip);
+
+      if (ipParts != null) {
+        targets.add(
+          InternetAddress(
+            '${ipParts[0]}.${ipParts[1]}.${ipParts[2]}.255',
+          ),
+        );
+      }
+
+      debugPrint(
+        '[DISCOVERY] BROADCAST TARGETS: '
+        '${targets.map((e) => e.address).join(', ')}',
+      );
+
+      /// =========================================
+      /// MULTIPLE BROADCAST ATTEMPTS
+      /// =========================================
+
+      for (var i = 0; i < 8; i++) {
+        debugPrint(
+          '[DISCOVERY] Broadcast attempt ${i + 1}/8',
+        );
+
+        await sendDiscovery(
+          socket,
+          targets: targets,
+        );
+
+        /// hotspot / android kadang perlu jeda
+        await Future.delayed(
+          const Duration(milliseconds: 400),
+        );
+      }
+
+      /// =========================================
+      /// FALLBACK UNICAST SCAN
+      /// =========================================
+      ///
+      /// HANYA local /24
+      /// jangan scan subnet besar
+      /// karena hotspot/mobile network bisa freeze
+      ///
+
+      debugPrint('[DISCOVERY] Starting fallback local scan');
+
+      await scanSubnet(
+        socket,
+        deviceIp: info.ip,
+      );
+
+      /// tunggu reply
+      await Future.delayed(
+        _config.timeout,
+      );
+
+      final result = discovered.toList()..sort();
+
+      debugPrint(
+        '[DISCOVERY] FINISHED (${result.length} devices)',
+      );
+
+      return result;
     } on SocketException catch (error) {
-      debugPrint('[DISCOVERY] Failed to bind UDP socket: $error');
+      debugPrint('[DISCOVERY] Socket error: $error');
       return const [];
-    } catch (error) {
-      debugPrint('[DISCOVERY] Discovery failed: $error');
+    } catch (error, stack) {
+      debugPrint('[DISCOVERY] Fatal error: $error');
+      debugPrint(stack.toString());
+
       return const [];
     } finally {
       await subscription?.cancel();
+
       socket?.close();
-      debugPrint('[DISCOVERY] Discovery finished, socket closed');
+
+      debugPrint('[DISCOVERY] SOCKET CLOSED');
     }
   }
 
-  List<String> _buildScanTargets(String ip, String? subnet) {
-    final ipParts = _parseIpv4(ip);
+  /// =========================================
+  /// FALLBACK LOCAL SCAN
+  /// =========================================
+  ///
+  /// scan ringan
+  /// tidak bergantung subnet
+  /// aman untuk hotspot / tethering
+  ///
+  Future<void> scanSubnet(
+    RawDatagramSocket socket, {
+    required String deviceIp,
+  }) async {
+    final ipParts = _parseIpv4(deviceIp);
+
     if (ipParts == null) {
-      return const [];
+      return;
     }
 
-    final subnetParts = _parseIpv4(subnet);
-    if (subnetParts == null) {
-      final fallback = List<String>.generate(
-        254,
-        (index) => '${ipParts[0]}.${ipParts[1]}.${ipParts[2]}.${index + 1}',
-      ).where((host) => host != ip).toList();
-
-      debugPrint(
-        '[DISCOVERY] Subnet unavailable, fallback scan on /24 segment',
-      );
-      return fallback;
-    }
-
-    final prefixLength = _prefixLength(subnetParts);
-    if (prefixLength >= 24) {
-      final networkParts = List<int>.generate(
-        4,
-        (index) => ipParts[index] & subnetParts[index],
-      );
-      final lastOctetBase =
-          '${networkParts[0]}.${networkParts[1]}.${networkParts[2]}';
-
-      return List<String>.generate(
-        254,
-        (index) => '$lastOctetBase.${index + 1}',
-      ).where((host) => host != ip).toList();
-    }
+    final targets = List<String>.generate(
+      254,
+      (index) =>
+          '${ipParts[0]}.${ipParts[1]}.${ipParts[2]}.${index + 1}',
+    ).where((ip) => ip != deviceIp).toList();
 
     debugPrint(
-      '[DISCOVERY] Prefix /$prefixLength too wide, limiting scan to local /24 window',
+      '[DISCOVERY] Fallback scan ${targets.length} hosts',
     );
-    return List<String>.generate(
-      254,
-      (index) => '${ipParts[0]}.${ipParts[1]}.${ipParts[2]}.${index + 1}',
-    ).where((host) => host != ip).toList();
+
+    /// jangan flood router
+    const batchSize = 20;
+
+    for (var i = 0; i < targets.length; i += batchSize) {
+      final end = (i + batchSize > targets.length)
+          ? targets.length
+          : i + batchSize;
+
+      final batch = targets.sublist(i, end);
+
+      for (final host in batch) {
+        await sendDiscovery(
+          socket,
+          targets: [
+            InternetAddress(host),
+          ],
+        );
+
+        /// VERY IMPORTANT
+        /// hotspot android/iOS sering drop packet
+        await Future.delayed(
+          const Duration(milliseconds: 8),
+        );
+      }
+
+      await Future.delayed(
+        const Duration(milliseconds: 100),
+      );
+    }
   }
 
   List<int>? _parseIpv4(String? value) {
@@ -350,9 +442,11 @@ class Esp32DiscoveryService {
     }
 
     final parts = value!.split('.').map(int.parse).toList();
-    if (parts.length != 4 || parts.any((part) => part < 0 || part > 255)) {
+
+    if (parts.length != 4) {
       return null;
     }
+
     return parts;
   }
 
@@ -362,32 +456,25 @@ class Esp32DiscoveryService {
     }
 
     final parts = value.split('.');
+
     if (parts.length != 4) {
       return false;
     }
 
     return parts.every((part) {
       final parsed = int.tryParse(part);
-      return parsed != null && parsed >= 0 && parsed <= 255;
-    });
-  }
 
-  int _prefixLength(List<int> subnetParts) {
-    var bits = 0;
-    for (final octet in subnetParts) {
-      bits += octet
-          .toRadixString(2)
-          .split('')
-          .where((bit) => bit == '1')
-          .length;
-    }
-    return bits;
+      return parsed != null &&
+          parsed >= 0 &&
+          parsed <= 255;
+    });
   }
 
   String? _sanitizeSsid(String? value) {
     if (value == null || value.isEmpty) {
       return null;
     }
+
     return value.replaceAll('"', '');
   }
 }
@@ -735,7 +822,7 @@ class MonitorPage extends StatefulWidget {
 
 class _MonitorPageState extends State<MonitorPage> {
   double distance = 0;
-  double weight = 0;
+
   double temperature = 0;
   late final Timer timer;
 
@@ -764,7 +851,7 @@ class _MonitorPageState extends State<MonitorPage> {
 
       setState(() {
         distance = (data['distance'] as num?)?.toDouble() ?? 0;
-        weight = (data['weight'] as num?)?.toDouble() ?? 0;
+        
         temperature = (data['temperature'] as num?)?.toDouble() ?? 0;
       });
     } catch (error) {
@@ -846,16 +933,7 @@ class _MonitorPageState extends State<MonitorPage> {
                   ),
                 ],
               ),
-              Row(
-                children: [
-                  Expanded(
-                    child: sensorCard(
-                      'Weight',
-                      '${weight.toStringAsFixed(2)} kg',
-                    ),
-                  ),
-                ],
-              ),
+              
               Row(
                 children: [
                   Expanded(
